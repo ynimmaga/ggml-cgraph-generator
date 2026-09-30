@@ -1,0 +1,38 @@
+# Compiled binaries -- rebuild via build.sh; not portable across machines anyway
+# (they hardcode -I/-L paths into local ov-master / genai-ggml / ggml-install trees).
+batched_prefill_test
+bucketed_pipeline_demo
+bucketed_pipeline_demo1
+bucketed_pipeline_demo_2bucket
+bucketed_pipeline_demo4
+bucketed_prefill
+continuous_batch_test
+dump_cgraph
+dump_graph
+dump_vision
+emit_ggml
+genai_ggml
+genai_ggml_standalone
+ov2ggml
+ov_fallback
+partial_batch_test
+prefill_benchmark
+run_ov
+use_ov_cgraph
+use_ov_ggml
+vlm_e2e
+vlm_pipeline_demo
+mem_check
+archprobe/probe_arch
+archprobe/probe_emit
+
+# Regeneratable synthetic-GGUF test fixtures (gen_synthetic.py rebuilds these from gguf-py's
+# tables in seconds; 141 files, ~83MB, no reason to store them).
+archprobe/synth/
+
+# Dumped cgraph artifacts are large, model-specific, and reproducible via the dump tools --
+# keep the tools, not their output.
+*.json
+
+__pycache__/
+*.pyc
