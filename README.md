@@ -31,7 +31,12 @@ you want `dump_vision` too — that needs `libmtmd`).
 LLAMA_CPP_DIR=/path/to/llama.cpp ./build.sh
 ```
 
-Produces `dump_cgraph` and `dump_vision`.
+Produces `dump_cgraph` and `dump_vision`. To also build `dump_whisper`, point `WHISPER_CPP_DIR`
+at a built [whisper.cpp](https://github.com/ggml-org/whisper.cpp) tree:
+
+```sh
+LLAMA_CPP_DIR=/path/to/llama.cpp WHISPER_CPP_DIR=/path/to/whisper.cpp ./build.sh
+```
 
 ## `dump_cgraph` — text decoder graphs
 
@@ -104,6 +109,32 @@ runs *after* preprocessing.
 ```sh
 ./dump_vision mmproj-model.gguf text-model.gguf vision.json 512
 ```
+
+## `dump_whisper` — whisper.cpp speech-recognition models
+
+```sh
+./dump_whisper <ggml-model.bin> [out_prefix]
+```
+
+Takes a whisper.cpp model (`ggml-*.bin`, e.g. `ggml-base.bin`) and writes three files:
+
+| File | Contents |
+|---|---|
+| `<prefix>.encoder.json` | log-mel → conv stem → audio encoder → cross-attention K/V. whisper.cpp runs these as three separately scheduled graphs; they are captured as one, chained through the tensors that connect them. Input `mel` (`[n_mels][2·n_audio_ctx]`); outputs are the `cache_k_cross`/`cache_v_cross` tensors. |
+| `<prefix>.decoder.json` | One text token per forward pass over the full self-attention cache (`n_kv` = whisper.cpp's padded text context, 512). Inputs `embd`, `position`, `KQ_mask` (f32), `inp_kv_idx` (i64); reads `cache_{k,v}_cross`. |
+| `<prefix>.gguf` | Every weight under whisper.cpp's tensor names, plus `whisper.*` metadata: hparams, special token ids (`whisper.token.*`), language codes (`whisper.languages`) and the vocabulary as raw bytes (`whisper.vocab.bytes` + `whisper.vocab.offsets`, since byte-level tokens can contain NUL). A runtime needs no whisper.cpp files beyond this. |
+
+How it differs from the llama.cpp dumpers, and why:
+
+- **It compiles whisper.cpp's source in.** whisper.cpp has no public `cb_eval`, and its graph
+  builders are file-static, so including its source is the only way to reach them without patching
+  it. The graphs are built exactly as whisper.cpp builds them (flash attention on, CPU weights) and
+  walked directly; no inference runs.
+- **One rewrite, in the decoder.** whisper.cpp stores each token's K/V with `ggml_cpy` into a
+  cache view whose byte offset bakes in the write position, which a shape-static replay would
+  freeze to one slot. Those copies are re-expressed as `SET_ROWS` into a per-layer cache view,
+  indexed by an `inp_kv_idx` input — the form llama.cpp graphs already use. The console prints how
+  many stores were rewritten (2 × decoder layers).
 
 ## Output format (`"ov-cgraph-v1"`)
 

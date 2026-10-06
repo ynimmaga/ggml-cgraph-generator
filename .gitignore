@@ -2,3 +2,4 @@ dump_cgraph
 dump_vision
 *.json
 *.o
+dump_whisper

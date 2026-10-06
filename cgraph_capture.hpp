@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 namespace cgraph {
 
@@ -43,6 +44,10 @@ struct Capture {
     std::map<std::string, std::string> weights;  // id -> ggml type
     std::map<std::string, std::string> weight_names;  // id -> gguf tensor name to resolve
     size_t counter = 0;
+    // See eval_cb: a second IM2COL normally means a vision model started encoding another tile.
+    // Graphs with more than one convolution in a single pass (e.g. whisper's two-conv audio
+    // stem) must turn this off or the first convolution is discarded.
+    bool reset_on_im2col = true;
 
     // Model init routinely runs its own graph passes before we get control back --
     // clip_init's flash-attention auto-probe (reserve_compute_meta) and, if requested, an
@@ -115,6 +120,11 @@ inline std::string op_string(const ggml_tensor* t) {
     if (t->op == GGML_OP_UNARY) {
         return std::string("GGML_UNARY_OP_") + ggml_unary_op_name(static_cast<ggml_unary_op>(t->op_params[0]));
     }
+    // ggml_view_tensor() makes a view WITHOUT setting op (it stays GGML_OP_NONE); only view_src
+    // marks it. It is metadata-only exactly like GGML_OP_VIEW, so record it as one.
+    if (t->op == GGML_OP_NONE && t->view_src) {
+        return "GGML_OP_VIEW";
+    }
     return std::string("GGML_OP_") + ggml_op_name(t->op);
 }
 
@@ -129,7 +139,7 @@ inline bool eval_cb(ggml_tensor* t, bool ask, void* user_data) {
     // pointers from an earlier tile get reused by the next one, corrupting a pointer-keyed
     // identity map (a later node can appear to reference itself). Seeing IM2COL again after we
     // already have nodes means a new pass started; keep only the most recent one.
-    if (t->op == GGML_OP_IM2COL && !cap->nodes.empty()) {
+    if (t->op == GGML_OP_IM2COL && cap->reset_on_im2col && !cap->nodes.empty()) {
         cap->reset();
     }
     // The scheduler can revisit a node across splits; intern() makes the first sighting win.
@@ -152,11 +162,26 @@ inline bool eval_cb(ggml_tensor* t, bool ask, void* user_data) {
         n.view_src = cap->intern(t->view_src);
         n.view_offs = t->view_offs;
         if (vs_new && t->view_src->op == GGML_OP_NONE) {
-            cap->record_leaf(t->view_src, n.view_src);  // e.g. cache_k_l0 behind its view
+            const ggml_tensor* vs = t->view_src;
+            cap->record_leaf(vs, n.view_src);  // e.g. cache_k_l0 behind its view
+            // A weight can be reached only through a view (whisper slices its positional
+            // embedding this way). A view_src is usually a KV cache, so only its buffer's usage
+            // can tell them apart -- model loaders tag weight buffers WEIGHTS, caches are not.
+            if (vs->buffer && !(vs->flags & GGML_TENSOR_FLAG_INPUT) &&
+                ggml_backend_buffer_get_usage(vs->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                cap->weights[n.view_src] = ggml_type_name(vs->type);
+                cap->weight_names[n.view_src] = ggml_get_name(vs);
+            }
         }
     }
     for (int i = 0; i < GGML_MAX_SRC && t->src[i]; i++) {
         ggml_tensor* s = t->src[i];
+        // An op-less view (see op_string) is never handed to cb_eval on its own, and it is not a
+        // leaf either -- treating it as one would turn e.g. whisper's view of the conv output into
+        // an empty graph input. Capture it as a node, ahead of this one.
+        if (!cap->ids.count(s) && s->op == GGML_OP_NONE && s->view_src) {
+            eval_cb(s, true, user_data);
+        }
         const bool is_leaf = !cap->ids.count(s) && s->op == GGML_OP_NONE;
         const std::string sid = cap->intern(s);
         n.inputs.emplace_back(sid);

@@ -19,3 +19,16 @@ echo "built dump_cgraph"
 # built when llama.cpp is configured with LLAMA_BUILD_TOOLS=ON, its default).
 g++ -O2 -std=c++17 $INC dump_vision.cpp -o dump_vision $LIB -lmtmd $RPATH
 echo "built dump_vision"
+
+# dump_whisper is optional: set WHISPER_CPP_DIR to a built whisper.cpp tree (its ggml libraries
+# under WHISPER_CPP_DIR/build/bin). whisper.cpp has no public graph callback, so its own source is
+# compiled into the tool (see dump_whisper.cpp); it links whisper.cpp's ggml, not llama.cpp.
+if [ -n "$WHISPER_CPP_DIR" ]; then
+    W="$WHISPER_CPP_DIR"
+    WVER=$(grep -o 'WHISPER_VERSION=[^ ]*' "$W/build/build.ninja" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\\')
+    WVER="${WVER:-\"unknown\"}"
+    g++ -O2 -std=c++17 "-DWHISPER_VERSION=$WVER" -I. -I$W/include -I$W/src -I$W/ggml/include \
+        dump_whisper.cpp $W/src/aneforge/whisper-aneforge.cpp -o dump_whisper \
+        -L$W/build/bin -lggml -lggml-base -lggml-cpu -lpthread -Wl,-rpath,$W/build/bin
+    echo "built dump_whisper"
+fi
