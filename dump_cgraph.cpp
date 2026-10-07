@@ -63,11 +63,33 @@ int main(int argc, char** argv) {
     // logits, so N independent sequences occupying the N rows can each sample their own next
     // token from one forward pass.
     const bool all_logits = getenv("ALL_LOGITS") != nullptr;
+    // Quantized KV cache: KV_TYPE=q8_0 / q4_0 / ... (any ggml type name; default f16). The cache
+    // leaves are then recorded with that type, SET_ROWS quantizes on store and FLASH_ATTN_EXT
+    // reads the quantized K/V -- nothing changes on the replay side.
+    ggml_type kv_type = GGML_TYPE_F16;
+    if (const char* kt = getenv("KV_TYPE")) {
+        int i = 0;
+        for (; i < GGML_TYPE_COUNT; i++) {
+            const char* name = ggml_type_name(static_cast<ggml_type>(i));
+            if (name && strcmp(name, kt) == 0) break;
+        }
+        if (i == GGML_TYPE_COUNT) {
+            fprintf(stderr, "unknown KV_TYPE '%s' (expected a ggml type name, e.g. q8_0)\n", kt);
+            return 1;
+        }
+        kv_type = static_cast<ggml_type>(i);
+    }
 
     llama_backend_init();
     ggml_backend_load_all();
 
     Capture cap;
+    // llama.cpp fills these rotation matrices once (quantized-KV-cache Hadamard rotation of Q/K/V);
+    // they are constants of the model + cache type, not per-step inputs.
+    cap.is_constant_input = [](const ggml_tensor* t) {
+        const std::string n = ggml_get_name(t);
+        return n.rfind("attn_inp_", 0) == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, "_rot") == 0;
+    };
 
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = 0;  // CPU: we want the topology, not performance
@@ -83,6 +105,9 @@ int main(int argc, char** argv) {
     cp.cb_eval = eval_cb;
     cp.cb_eval_user_data = &cap;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;  // match the OV builder's topology
+    // A quantized V cache requires flash attention, which is on for every decoder dump.
+    cp.type_k = kv_type;
+    cp.type_v = kv_type;
     if (embd_mode) {
         cp.embeddings = true;
         cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
@@ -169,7 +194,7 @@ int main(int argc, char** argv) {
         else if (kv.second.has_buffer && !cap.weights.count(kv.first)) n_cache++;
     }
     printf("graph inputs : %zu\n", n_in);
-    printf("kv caches    : %zu\n", n_cache);
+    printf("kv caches    : %zu (%s)\n", n_cache, ggml_type_name(kv_type));
     printf("total leaves : %zu\n", cap.leaves.size());
     printf("op types     : %zu\n", hist.size());
     for (const auto& h : hist) {

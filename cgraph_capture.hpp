@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -75,7 +76,15 @@ struct Capture {
         size_t nb[4] = {0, 0, 0, 0};
         bool is_input = false;   // GGML_TENSOR_FLAG_INPUT: caller writes it each step
         bool has_buffer = false; // preallocated by llama.cpp: a weight or a KV cache
+        // Value of a constant input (see is_constant_input), written into the artifact so the
+        // runtime does not need the producer's code to recreate it.
+        std::vector<uint8_t> data;
     };
+    // Some graph inputs are not per-step data but constants the producer fills once -- e.g.
+    // llama.cpp's Hadamard rotation matrices (attn_inp_k_rot / attn_inp_v_rot) used with a
+    // quantized KV cache. A dumper that knows its producer marks those here; their values are
+    // captured (inputs are already filled when cb_eval fires) and embedded in the artifact.
+    std::function<bool(const ggml_tensor*)> is_constant_input;
     std::map<std::string, Leaf> leaves;
 
     void record_leaf(const ggml_tensor* t, const std::string& id) {
@@ -92,6 +101,10 @@ struct Capture {
         }
         l.is_input = (t->flags & GGML_TENSOR_FLAG_INPUT) != 0;
         l.has_buffer = t->buffer != nullptr;
+        if (l.is_input && t->buffer && is_constant_input && is_constant_input(t)) {
+            l.data.resize(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, l.data.data(), 0, l.data.size());
+        }
         leaves.emplace(id, std::move(l));
     }
 
@@ -204,6 +217,18 @@ inline bool eval_cb(ggml_tensor* t, bool ask, void* user_data) {
     return false;  // do not ask the scheduler to break this node out
 }
 
+inline void base64(FILE* f, const std::vector<uint8_t>& d) {
+    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < d.size(); i += 3) {
+        const uint32_t v = (uint32_t(d[i]) << 16) | (i + 1 < d.size() ? uint32_t(d[i + 1]) << 8 : 0) |
+                           (i + 2 < d.size() ? uint32_t(d[i + 2]) : 0);
+        fputc(tbl[(v >> 18) & 63], f);
+        fputc(tbl[(v >> 12) & 63], f);
+        fputc(i + 1 < d.size() ? tbl[(v >> 6) & 63] : '=', f);
+        fputc(i + 2 < d.size() ? tbl[v & 63] : '=', f);
+    }
+}
+
 inline void json_escape(FILE* f, const std::string& s) {
     for (char c : s) {
         if (c == '"' || c == '\\') {
@@ -249,9 +274,15 @@ inline void write_json(const Capture& cap, const std::string& path, const std::s
         json_escape(f, l.name);
         fprintf(f, "\", \"type\": \"%s\", \"ne\": [%" PRId64 ", %" PRId64 ", %" PRId64
                    ", %" PRId64 "], \"nb\": [%zu, %zu, %zu, %zu], \"is_input\": %s, "
-                   "\"has_buffer\": %s}",
+                   "\"has_buffer\": %s",
                 l.type.c_str(), l.ne[0], l.ne[1], l.ne[2], l.ne[3], l.nb[0], l.nb[1], l.nb[2],
                 l.nb[3], l.is_input ? "true" : "false", l.has_buffer ? "true" : "false");
+        if (!l.data.empty()) {
+            fprintf(f, ", \"data_b64\": \"");
+            base64(f, l.data);
+            fputc('"', f);
+        }
+        fputc('}', f);
         first = false;
     }
     fprintf(f, "\n  ],\n  \"nodes\": [\n");
