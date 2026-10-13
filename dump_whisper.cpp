@@ -7,6 +7,10 @@
 //                            separately scheduled graphs; they are chained through tensors
 //                            (embd_conv, embd_enc), which the pointer-identity capture keeps
 //                            connected. Its observable outputs are the cache_{k,v}_cross tensors.
+//                            With SPLIT_CROSS=1 the encoder artifact stops at the encoder output
+//                            (embd_enc) and the K/V projections go to <prefix>.cross.json, which
+//                            takes embd_enc as its input -- the split an OpenVINO-style
+//                            encoder/decoder pair needs (encoder -> last_hidden_state).
 //   <prefix>.decoder.json -- one text token per pass, over the full self-attention KV cache,
 //                            reading cache_{k,v}_cross.
 //   <prefix>.gguf         -- every weight under whisper.cpp's own tensor names, plus whisper.*
@@ -58,7 +62,7 @@ void capture_graph(cgraph::Capture& cap, ggml_cgraph* gf) {
 // Capture the decoder, turning each "cpy(x, view(kv_self.{k,v}, offset(layer, kv_head)))" into
 // "set_rows(view(kv_self.{k,v}, layer), x, inp_kv_idx)". See the file header.
 void capture_decoder(cgraph::Capture& cap, ggml_cgraph* gf, whisper_state& st, int n_tokens,
-                     ggml_context* scratch) {
+                     ggml_context* scratch, bool cross_qk) {
     const ggml_tensor* caches[2] = {st.kv_self.k, st.kv_self.v};
     auto is_self_cache = [&](const ggml_tensor* t) {
         return t && (t == caches[0] || t == caches[1]);
@@ -69,7 +73,7 @@ void capture_decoder(cgraph::Capture& cap, ggml_cgraph* gf, whisper_state& st, i
     ggml_set_input(kv_idx);
 
     const int64_t n_ctx = st.kv_self.size;
-    int n_rewritten = 0;
+    int n_rewritten = 0, n_cross_qk = 0;
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
         ggml_tensor* t = ggml_graph_node(gf, i);
         // The fixed-offset destination views exist only to feed the copies being replaced.
@@ -104,8 +108,26 @@ void capture_decoder(cgraph::Capture& cap, ggml_cgraph* gf, whisper_state& st, i
             continue;
         }
         cgraph::eval_cb(t, true, &cap);
+        // CROSS_QK: also emit each layer's cross-attention scores, scale * Q.K over the audio
+        // frames (what word-level timestamps align on), as named graph outputs. Same Q, K and
+        // scale as the flash attention they shadow.
+        if (cross_qk && t->op == GGML_OP_FLASH_ATTN_EXT && t->src[1] && t->src[1]->view_src == st.kv_cross.k) {
+            float scale = 1.0f;
+            memcpy(&scale, t->op_params, sizeof(float));
+            ggml_tensor* kq = ggml_mul_mat(scratch, t->src[1], t->src[0]);  // [n_audio_ctx, n_tokens, n_head]
+            ggml_tensor* scores = ggml_scale(scratch, kq, scale);
+            ggml_format_name(kq, "cross_kq_l%d", n_cross_qk);
+            ggml_format_name(scores, "cross_attention_qk_scaled_scores_%d", n_cross_qk);
+            ggml_set_output(scores);
+            cgraph::eval_cb(kq, true, &cap);
+            cgraph::eval_cb(scores, true, &cap);
+            n_cross_qk++;
+        }
     }
     printf("kv stores rewritten to SET_ROWS: %d\n", n_rewritten);
+    if (cross_qk) {
+        printf("cross-attention score outputs: %d\n", n_cross_qk);
+    }
 }
 
 bool write_gguf(whisper_context& ctx, const std::string& path) {
@@ -188,6 +210,8 @@ int main(int argc, char** argv) {
     }
     const std::string model_path = argv[1];
     const std::string prefix = argc > 2 ? argv[2] : "whisper";
+    const char* split_env = getenv("SPLIT_CROSS");
+    const bool split_cross = split_env && split_env[0] == '1';
 
     auto cp = whisper_context_default_params();
     // Weights must land in host memory to be written to GGUF; the graph topology does not depend
@@ -218,12 +242,38 @@ int main(int argc, char** argv) {
         // earlier graph stay valid (and keep distinct addresses) while the next one is built.
         capture_graph(cap, whisper_build_graph_conv(*ctx, *st));
         capture_graph(cap, whisper_build_graph_encoder(*ctx, *st));
-        capture_graph(cap, whisper_build_graph_cross(*ctx, *st));
-        const std::string out = prefix + ".encoder.json";
-        cgraph::write_json(cap, out, model_path, "whisper-encoder", /*n_tokens=*/0, /*n_kv=*/0);
-        cgraph::report(cap, "whisper encoder (conv + encoder + cross K/V)");
+        if (split_cross) {
+            // Stop at the encoder output (embd_enc, [n_state, n_audio_ctx]); the cross K/V
+            // projection becomes its own artifact that takes embd_enc as an input.
+            const std::string out = prefix + ".encoder.json";
+            cgraph::write_json(cap, out, model_path, "whisper-encoder", /*n_tokens=*/0, /*n_kv=*/0);
+            cgraph::report(cap, "whisper encoder (conv + encoder)");
+            printf("wrote %s\n\n", out.c_str());
+
+            // The cross graph reads embd_enc, an op node of the encoder graph; build it over a
+            // fresh input leaf of the same shape instead.
+            ggml_context* leaf_ctx = ggml_init({ggml_tensor_overhead(), nullptr, /*no_alloc=*/true});
+            ggml_tensor* enc_out = st->embd_enc;
+            ggml_tensor* embd_enc = ggml_new_tensor(leaf_ctx, enc_out->type, GGML_MAX_DIMS, enc_out->ne);
+            ggml_set_name(embd_enc, "embd_enc");
+            ggml_set_input(embd_enc);
+            st->embd_enc = embd_enc;
+            cgraph::Capture cross;
+            capture_graph(cross, whisper_build_graph_cross(*ctx, *st));
+            st->embd_enc = enc_out;
+            ggml_free(leaf_ctx);
+            const std::string cross_out = prefix + ".cross.json";
+            cgraph::write_json(cross, cross_out, model_path, "whisper-cross", /*n_tokens=*/0, /*n_kv=*/0);
+            cgraph::report(cross, "whisper cross-attention K/V");
+            printf("wrote %s\n\n", cross_out.c_str());
+        } else {
+            capture_graph(cap, whisper_build_graph_cross(*ctx, *st));
+            const std::string out = prefix + ".encoder.json";
+            cgraph::write_json(cap, out, model_path, "whisper-encoder", /*n_tokens=*/0, /*n_kv=*/0);
+            cgraph::report(cap, "whisper encoder (conv + encoder + cross K/V)");
+            printf("wrote %s\n\n", out.c_str());
+        }
         printf("mel input    : [%d, %d]\n", 2 * hp.n_audio_ctx, hp.n_mels);
-        printf("wrote %s\n\n", out.c_str());
     }
 
     // ---- decoder: one token per pass over the whole self-attention cache ----
@@ -241,9 +291,10 @@ int main(int argc, char** argv) {
         ggml_cgraph* gf = whisper_build_graph_decoder(*ctx, *st, batch, false, /*worst_case=*/true);
 
         ggml_context* scratch =
-            ggml_init({ggml_tensor_overhead() * 256, nullptr, /*no_alloc=*/true});
+            ggml_init({ggml_tensor_overhead() * 512, nullptr, /*no_alloc=*/true});
         cgraph::Capture cap;
-        capture_decoder(cap, gf, *st, n_tokens, scratch);
+        const char* cross_qk_env = getenv("CROSS_QK");
+        capture_decoder(cap, gf, *st, n_tokens, scratch, cross_qk_env && cross_qk_env[0] == '1');
         const std::string out = prefix + ".decoder.json";
         cgraph::write_json(cap, out, model_path, "whisper-decoder", n_tokens,
                            static_cast<int>(st->kv_self.size));

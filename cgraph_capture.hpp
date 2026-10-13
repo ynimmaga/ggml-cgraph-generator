@@ -28,6 +28,7 @@ struct Node {
     std::string view_src;
     size_t view_offs = 0;
     bool is_input = false;
+    bool is_output = false;  // GGML_TENSOR_FLAG_OUTPUT: a named result besides the last node
     // Per-input shape/type, which the OV translators query and cannot re-derive once the
     // producing tensor is gone.
     std::vector<std::vector<int64_t>> input_ne;
@@ -170,6 +171,7 @@ inline bool eval_cb(ggml_tensor* t, bool ask, void* user_data) {
     }
     std::memcpy(n.op_params, t->op_params, sizeof(n.op_params));
     n.is_input = (t->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+    n.is_output = (t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
     if (t->view_src) {
         const bool vs_new = !cap->ids.count(t->view_src);
         n.view_src = cap->intern(t->view_src);
@@ -297,6 +299,9 @@ inline void write_json(const Capture& cap, const std::string& path, const std::s
         fprintf(f, ", \"ne\": [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]", n.ne[0],
                 n.ne[1], n.ne[2], n.ne[3]);
         fprintf(f, ", \"nb\": [%zu, %zu, %zu, %zu]", n.nb[0], n.nb[1], n.nb[2], n.nb[3]);
+        if (n.is_output) {
+            fprintf(f, ", \"is_output\": true");
+        }
         if (n.is_input) {
             fprintf(f, ", \"is_input\": true");
         }

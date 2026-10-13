@@ -45,6 +45,13 @@ int main(int argc, char** argv) {
     }
 
     cgraph::Capture cap;
+    // Index inputs of the vision tower (positional-embedding rows, which patch rows to keep past a
+    // class token) depend only on the resolution, which the artifact already fixes: record their
+    // values so a runtime does not have to know each projector's convention.
+    cap.is_constant_input = [](const ggml_tensor* t) {
+        const std::string n = ggml_get_name(t);
+        return n == "positions" || n == "patches";
+    };
     auto cp = mtmd_context_params_default();
     cp.use_gpu = false;  // topology, not performance
     cp.cb_eval = cgraph::eval_cb;

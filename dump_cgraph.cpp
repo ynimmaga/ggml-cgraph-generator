@@ -36,6 +36,35 @@
 
 using namespace cgraph;
 
+namespace {
+
+// Keep only the token embedding lookup and the leaves it reads (DUMP_TOKEN_EMBD).
+bool keep_token_embd(Capture& cap) {
+    for (size_t i = 0; i < cap.nodes.size(); i++) {
+        const Node& n = cap.nodes[i];
+        auto w = n.inputs.empty() ? cap.weight_names.end() : cap.weight_names.find(n.inputs[0]);
+        if (n.op != "GGML_OP_GET_ROWS" || w == cap.weight_names.end() || w->second != "token_embd.weight") {
+            continue;
+        }
+        Node lookup = n;
+        cap.nodes = {lookup};
+        std::map<std::string, Capture::Leaf> leaves;
+        std::map<std::string, std::string> weights, weight_names;
+        for (const auto& id : lookup.inputs) {
+            if (auto l = cap.leaves.find(id); l != cap.leaves.end()) leaves.insert(*l);
+            if (auto t = cap.weights.find(id); t != cap.weights.end()) weights.insert(*t);
+            if (auto g = cap.weight_names.find(id); g != cap.weight_names.end()) weight_names.insert(*g);
+        }
+        cap.leaves = std::move(leaves);
+        cap.weights = std::move(weights);
+        cap.weight_names = std::move(weight_names);
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: dump_cgraph <model.gguf> [out.json] [n_kv]\n");
@@ -63,6 +92,11 @@ int main(int argc, char** argv) {
     // logits, so N independent sequences occupying the N rows can each sample their own next
     // token from one forward pass.
     const bool all_logits = getenv("ALL_LOGITS") != nullptr;
+    // Token embedding lookup only: GET_ROWS(token_embd.weight, inp_tokens) for one token, cut out
+    // of the decoder graph. A VLM runtime needs it as a model of its own (text embeddings) to
+    // embed prompt tokens next to image features; dequantization stays in ggml, so it works for
+    // any weight type.
+    const bool token_embd_only = getenv("DUMP_TOKEN_EMBD") != nullptr;
     // Quantized KV cache: KV_TYPE=q8_0 / q4_0 / ... (any ggml type name; default f16). The cache
     // leaves are then recorded with that type, SET_ROWS quantizes on store and FLASH_ATTN_EXT
     // reads the quantized K/V -- nothing changes on the replay side.
@@ -126,6 +160,19 @@ int main(int argc, char** argv) {
     if (bos < 0) {
         bos = 1;
     }
+    // llama.cpp sizes the attention window to the used KV cells (padded to 256), not the whole
+    // cache: decoding into an empty cache would bake in a 256-slot window whatever n_kv is. Fill
+    // the cells the captured batch does not occupy first, so the graph spans all n_kv of them.
+    int32_t base_pos = 0;  // position of the captured batch's first row
+    if (!embd_mode && !token_embd_only && n_kv > n_tokens) {
+        static std::vector<llama_token> fill(n_kv - n_tokens, bos);
+        base_pos = static_cast<int32_t>(fill.size());
+        if (llama_decode(ctx, llama_batch_get_one(fill.data(), static_cast<int32_t>(fill.size()))) != 0) {
+            fprintf(stderr, "KV fill decode failed\n");
+            return 4;
+        }
+        cap.reset();
+    }
     // A VLM decoder graph needs SOME embedding values to shape n_embd correctly; the actual
     // values do not matter, we are capturing topology, not running inference. llama_batch_init
     // already allocates b.embd -- fill it in place, do not repoint it at another buffer, or
@@ -134,13 +181,17 @@ int main(int argc, char** argv) {
     llama_batch b;
     if (vlm_embd_input) {
         const int n_embd = llama_model_n_embd(model);
-        b = llama_batch_init(1, n_embd, 1);
-        b.n_tokens = 1;
-        std::fill(b.embd, b.embd + n_embd, 0.0f);
-        b.pos[0] = 0;
-        b.n_seq_id[0] = 1;
-        b.seq_id[0][0] = 0;
-        b.logits[0] = 1;
+        // N_TOKENS rows give batched-prefill buckets for the embedding-input decoder too; only
+        // the last row produces logits, as in the token-id path.
+        b = llama_batch_init(n_tokens, n_embd, 1);
+        b.n_tokens = n_tokens;
+        std::fill(b.embd, b.embd + static_cast<size_t>(n_tokens) * n_embd, 0.0f);
+        for (int i = 0; i < n_tokens; i++) {
+            b.pos[i] = base_pos + i;
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i] = i == n_tokens - 1;
+        }
     } else if (all_logits) {
         // Manual batch: llama_batch_get_one only flags the last row for logits, so build one
         // by hand and set every row's flag. Token/position values don't matter for topology.
@@ -148,7 +199,7 @@ int main(int argc, char** argv) {
         b.n_tokens = n_tokens;
         for (int i = 0; i < n_tokens; i++) {
             b.token[i] = bos;
-            b.pos[i] = i;
+            b.pos[i] = base_pos + i;
             b.n_seq_id[i] = 1;
             b.seq_id[i][0] = 0;
             b.logits[i] = 1;
@@ -174,7 +225,11 @@ int main(int argc, char** argv) {
     char arch_buf[128] = {0};
     llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf));
 
-    write_json(cap, out, path, arch_buf, vlm_embd_input ? 1 : n_tokens, n_kv);
+    if (token_embd_only && !keep_token_embd(cap)) {
+        fprintf(stderr, "no GET_ROWS(token_embd.weight, ...) in the graph\n");
+        return 5;
+    }
+    write_json(cap, out, path, arch_buf, n_tokens, n_kv);
     if (vlm_embd_input || all_logits) {
         llama_batch_free(b);
     }
