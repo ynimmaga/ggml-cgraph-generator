@@ -136,7 +136,12 @@ int main(int argc, char** argv) {
     auto cp = llama_context_default_params();
     cp.n_ctx = n_kv;
     cp.n_batch = n_kv;
-    cp.cb_eval = eval_cb;
+    // REF_OUT=<file>: also write llama.cpp's value of every node (see write_ref). Use NO_FILL=1 with it:
+    // the captured decode is then the first token at position 0 of an empty cache, which a replay
+    // can reproduce exactly.
+    const char* ref_out = getenv("REF_OUT");
+    const bool no_fill = getenv("NO_FILL") != nullptr;
+    cp.cb_eval = ref_out ? eval_cb_values : eval_cb;
     cp.cb_eval_user_data = &cap;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;  // match the OV builder's topology
     // A quantized V cache requires flash attention, which is on for every decoder dump.
@@ -144,11 +149,18 @@ int main(int argc, char** argv) {
     cp.type_v = kv_type;
     if (embd_mode) {
         cp.embeddings = true;
-        cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        // DUMP_EMBEDDINGS=none dumps per-token hidden states (with ALL_LOGITS=1) for hosts that pool themselves,
+        // e.g. OpenVINO GenAI's TextEmbeddingPipeline; any other value keeps the in-graph mean pooling.
+        const char* pool = getenv("DUMP_EMBEDDINGS");
+        cp.pooling_type = !strcmp(pool, "none") ? LLAMA_POOLING_TYPE_NONE : LLAMA_POOLING_TYPE_MEAN;
         // Encoders attend bidirectionally, so flash attention with a causal mask is wrong here.
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
     llama_context* ctx = llama_init_from_model(model, cp);
+    // NON_CAUSAL=1: full bidirectional attention over the batch, as diffusion language models use.
+    if (ctx && getenv("NON_CAUSAL")) {
+        llama_set_causal_attn(ctx, false);
+    }
     if (!ctx) {
         fprintf(stderr, "failed to create context\n");
         return 3;
@@ -164,7 +176,7 @@ int main(int argc, char** argv) {
     // cache: decoding into an empty cache would bake in a 256-slot window whatever n_kv is. Fill
     // the cells the captured batch does not occupy first, so the graph spans all n_kv of them.
     int32_t base_pos = 0;  // position of the captured batch's first row
-    if (!embd_mode && !token_embd_only && n_kv > n_tokens) {
+    if (!embd_mode && !token_embd_only && !no_fill && n_kv > n_tokens) {
         static std::vector<llama_token> fill(n_kv - n_tokens, bos);
         base_pos = static_cast<int32_t>(fill.size());
         if (llama_decode(ctx, llama_batch_get_one(fill.data(), static_cast<int32_t>(fill.size()))) != 0) {
@@ -191,6 +203,20 @@ int main(int argc, char** argv) {
             b.n_seq_id[i] = 1;
             b.seq_id[i][0] = 0;
             b.logits[i] = i == n_tokens - 1;
+        }
+    } else if (all_logits && getenv("PROMPT_IDS")) {
+        // PROMPT_IDS="1 2 3 ...": real token ids instead of BOS repeated (needs N_TOKENS to match)
+        std::vector<llama_token> ids;
+        { char* e = strdup(getenv("PROMPT_IDS")); for (char* p = strtok(e, " ,"); p; p = strtok(nullptr, " ,")) ids.push_back(atoi(p)); free(e); }
+        if (static_cast<int>(ids.size()) != n_tokens) { fprintf(stderr, "PROMPT_IDS has %zu ids, N_TOKENS is %d\n", ids.size(), n_tokens); return 1; }
+        b = llama_batch_init(n_tokens, 0, 1);
+        b.n_tokens = n_tokens;
+        for (int i = 0; i < n_tokens; i++) {
+            b.token[i] = ids[i];
+            b.pos[i] = base_pos + i;
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i] = 1;
         }
     } else if (all_logits) {
         // Manual batch: llama_batch_get_one only flags the last row for logits, so build one
@@ -230,6 +256,10 @@ int main(int argc, char** argv) {
         return 5;
     }
     write_json(cap, out, path, arch_buf, n_tokens, n_kv);
+    if (ref_out) {
+        write_ref(cap, ref_out);
+        write_ref_inputs(std::string(ref_out) + ".inputs");
+    }
     if (vlm_embd_input || all_logits) {
         llama_batch_free(b);
     }

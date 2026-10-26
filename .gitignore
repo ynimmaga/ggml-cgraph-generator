@@ -3,3 +3,6 @@ dump_vision
 *.json
 *.o
 dump_whisper
+dump_cgraph_head
+dump_cgraph_nofhc
+dump_cgraph_prism

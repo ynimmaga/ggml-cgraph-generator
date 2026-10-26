@@ -102,7 +102,10 @@ struct Capture {
         }
         l.is_input = (t->flags & GGML_TENSOR_FLAG_INPUT) != 0;
         l.has_buffer = t->buffer != nullptr;
-        if (l.is_input && t->buffer && is_constant_input && is_constant_input(t)) {
+        // PrismML's Hadamard rotation matrices and sign vectors are generated at model load, not read
+        // from the .gguf: carry their values in the artifact.
+        const bool generated = t->buffer && !l.is_input && l.name.rfind("prism.hadamard", 0) == 0;
+        if (generated || (l.is_input && t->buffer && is_constant_input && is_constant_input(t))) {
             l.data.resize(ggml_nbytes(t));
             ggml_backend_tensor_get(t, l.data.data(), 0, l.data.size());
         }
@@ -209,7 +212,7 @@ inline bool eval_cb(ggml_tensor* t, bool ask, void* user_data) {
             // A leaf with a buffer, no op and no INPUT flag is either a .gguf weight or a KV
             // cache. Weights are resolvable by name in the file; caches are not, so the
             // distinction is left to the loader, which has the file open.
-            if (s->buffer && !(s->flags & GGML_TENSOR_FLAG_INPUT)) {
+            if (s->buffer && !(s->flags & GGML_TENSOR_FLAG_INPUT) && strncmp(ggml_get_name(s), "prism.hadamard", 14) != 0) {
                 cap->weights[sid] = ggml_type_name(s->type);
                 cap->weight_names[sid] = ggml_get_name(s);
             }
@@ -217,6 +220,103 @@ inline bool eval_cb(ggml_tensor* t, bool ask, void* user_data) {
     }
     cap->nodes.push_back(std::move(n));
     return false;  // do not ask the scheduler to break this node out
+}
+
+// ---- reference values (REF_OUT) ------------------------------------------------------------
+// Besides the topology, record the value every node had when llama.cpp computed it, so a replay
+// can be checked node by node and the first divergence points at the faulty op. Only contiguous
+// f32/f16 nodes are kept; the scheduler is asked to break each node out so its result can be read.
+inline std::map<std::string, std::vector<float>> g_ref_values;  // node id -> values
+
+// The graph's input tensors as llama.cpp set them for this pass, so a replay can feed the identical
+// values whatever the architecture's inputs are (tokens, positions, masks, pooling matrices, ...).
+struct RefInput {
+    int32_t type = 0;
+    int64_t ne[4] = {1, 1, 1, 1};
+    std::vector<uint8_t> data;
+};
+inline std::map<std::string, RefInput> g_ref_inputs;
+
+inline bool eval_cb_values(ggml_tensor* t, bool ask, void* user_data) {
+    auto* cap = static_cast<Capture*>(user_data);
+    if (ask) {
+        for (int i = 0; i < GGML_MAX_SRC && t->src[i]; i++) {
+            const ggml_tensor* s = t->src[i];
+            if ((s->flags & GGML_TENSOR_FLAG_INPUT) && s->buffer && !g_ref_inputs.count(ggml_get_name(s))) {
+                RefInput in;
+                in.type = static_cast<int32_t>(s->type);
+                for (int d = 0; d < 4; d++) in.ne[d] = s->ne[d];
+                in.data.resize(ggml_nbytes(s));
+                ggml_backend_tensor_get(s, in.data.data(), 0, in.data.size());
+                g_ref_inputs[ggml_get_name(s)] = std::move(in);
+            }
+        }
+        eval_cb(t, true, user_data);
+        return true;
+    }
+    auto it = cap->ids.find(t);
+    if (it == cap->ids.end() || !ggml_is_contiguous(t) ||
+        (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_I32)) {
+        return true;
+    }
+    const size_t n = ggml_nelements(t);
+    std::vector<float> v(n);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, v.data(), 0, n * sizeof(float));
+    } else if (t->type == GGML_TYPE_I32) {  // integer tensors (expert ids, ...) are kept as exact floats
+        std::vector<int32_t> iv(n);
+        ggml_backend_tensor_get(t, iv.data(), 0, n * sizeof(int32_t));
+        for (size_t i = 0; i < n; i++) v[i] = static_cast<float>(iv[i]);
+    } else {
+        std::vector<ggml_fp16_t> h(n);
+        ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(ggml_fp16_t));
+        for (size_t i = 0; i < n; i++) v[i] = ggml_fp16_to_fp32(h[i]);
+    }
+    g_ref_values[it->second] = std::move(v);
+    return true;
+}
+
+// Per node, in artifact order: u32 name length, name, i64 ne[4], u64 count (0 = no values), floats.
+inline void write_ref(const Capture& cap, const std::string& path) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "cannot write %s\n", path.c_str());
+        return;
+    }
+    size_t kept = 0;
+    for (const auto& n : cap.nodes) {
+        const uint32_t len = static_cast<uint32_t>(n.name.size());
+        fwrite(&len, sizeof(len), 1, f);
+        fwrite(n.name.data(), 1, len, f);
+        fwrite(n.ne, sizeof(int64_t), 4, f);
+        auto it = g_ref_values.find(n.id);
+        const uint64_t count = it == g_ref_values.end() ? 0 : it->second.size();
+        fwrite(&count, sizeof(count), 1, f);
+        if (count) {
+            fwrite(it->second.data(), sizeof(float), count, f);
+            kept++;
+        }
+    }
+    fclose(f);
+    printf("reference values: %zu of %zu nodes -> %s\n", kept, cap.nodes.size(), path.c_str());
+}
+
+// Per input: u32 name length, name, i32 type, i64 ne[4], u64 byte count, bytes.
+inline void write_ref_inputs(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    for (const auto& [name, in] : g_ref_inputs) {
+        const uint32_t len = static_cast<uint32_t>(name.size());
+        const uint64_t n = in.data.size();
+        fwrite(&len, sizeof(len), 1, f);
+        fwrite(name.data(), 1, len, f);
+        fwrite(&in.type, sizeof(in.type), 1, f);
+        fwrite(in.ne, sizeof(int64_t), 4, f);
+        fwrite(&n, sizeof(n), 1, f);
+        fwrite(in.data.data(), 1, n, f);
+    }
+    fclose(f);
+    printf("reference inputs: %zu -> %s\n", g_ref_inputs.size(), path.c_str());
 }
 
 inline void base64(FILE* f, const std::vector<uint8_t>& d) {

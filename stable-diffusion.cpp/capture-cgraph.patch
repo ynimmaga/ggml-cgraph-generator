@@ -1,0 +1,107 @@
+diff --git a/src/core/ggml_runner.cpp b/src/core/ggml_runner.cpp
+index 1efcb9f..83791b4 100644
+--- a/src/core/ggml_runner.cpp
++++ b/src/core/ggml_runner.cpp
+@@ -759,7 +759,61 @@ bool GGMLRunner::fits(const std::vector<DeviceMemoryRequest>& requests,
+     return true;
+ }
+ 
++#include <cstdlib>
++#include "cgraph_capture.hpp"
++
++// the DiT inputs named in qwen_image_2_1.hpp stay inputs (unless OV_CGRAPH_BAKED=1); every other input is a constant
++static bool ov_is_constant_input(const ggml_tensor* t) {
++    return getenv("OV_CGRAPH_BAKED") != nullptr || strncmp(ggml_get_name(t), "dit_", 4) != 0;
++}
++
++// ov-cgraph: OV_CGRAPH_OUT=<file> [OV_CGRAPH_RUNNER=<desc>] [OV_CGRAPH_CALL=<n>] writes the n-th graph of that runner
++// as a cgraph artifact, with every graph input's current value embedded (a fixed-input proof of concept).
++static bool ov_capture_graph(const std::string& desc, ggml_cgraph* graph) {
++    static int calls = 0;
++    const char* out = getenv("OV_CGRAPH_OUT");
++    const char* want = getenv("OV_CGRAPH_RUNNER");
++    if (!out || desc != (want ? want : "qwen_image_2_1")) {
++        return false;
++    }
++    if (++calls != (getenv("OV_CGRAPH_CALL") ? atoi(getenv("OV_CGRAPH_CALL")) : 1)) {
++        return false;
++    }
++    cgraph::Capture cap;
++    cap.reset_on_im2col = false;
++    cap.is_constant_input = ov_is_constant_input;
++    const int n = ggml_graph_n_nodes(graph);
++    for (int i = 0; i < n; i++) {
++        cgraph::eval_cb(ggml_graph_node(graph, i), true, &cap);
++    }
++    cgraph::write_json(cap, out, desc, desc, 0, 0);
++    fprintf(stderr, "[ov-cgraph] wrote %s: %d nodes\n", out, n);
++    return true;
++}
++
++// the graph's output (its last node), as float32, for a reference
++static void ov_write_output(const char* path, ggml_cgraph* graph) {
++    ggml_tensor* t = ggml_graph_node(graph, ggml_graph_n_nodes(graph) - 1);
++    std::vector<float> v(ggml_nelements(t));
++    if (t->type == GGML_TYPE_F32) {
++        ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
++    }
++    FILE* f = fopen(path, "wb");
++    fwrite(v.data(), sizeof(float), v.size(), f);
++    fclose(f);
++    fprintf(stderr, "[ov-cgraph] reference output %s: ne=[%lld,%lld,%lld,%lld] type %s\n", path, (long long)t->ne[0], (long long)t->ne[1],
++            (long long)t->ne[2], (long long)t->ne[3], ggml_type_name(t->type));
++}
++
+ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
++    const bool ov_captured = ov_capture_graph(get_desc(), graph);
++    static cgraph::Capture ov_ref_cap;
++    const bool ov_ref = ov_captured && getenv("OV_CGRAPH_REF") != nullptr;
++    if (ov_ref) {
++        ov_ref_cap.reset_on_im2col = false;
++        ov_ref_cap.is_constant_input = ov_is_constant_input;
++        sd_set_backend_eval_callback(cgraph::eval_cb_values, &ov_ref_cap);
++    }
+     if (sd_backend_is_cpu(runtime_backend)) {
+         sd_backend_cpu_set_n_threads(runtime_backend, n_threads);
+     }
+@@ -780,6 +834,16 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
+                                                              sd_get_backend_eval_callback_data());
+     }
+     workspace_.synchronize();
++    if (ov_ref) {
++        sd_set_backend_eval_callback(nullptr, nullptr);
++        const std::string base = getenv("OV_CGRAPH_OUT");
++        cgraph::write_json(ov_ref_cap, base, "qwen_image_2_1", "qwen_image_2_1", 0, 0);
++        cgraph::write_ref(ov_ref_cap, base + ".values");
++        cgraph::write_ref_inputs(base + ".values.inputs");
++    }
++    if (ov_captured && status == GGML_STATUS_SUCCESS) {
++        ov_write_output((std::string(getenv("OV_CGRAPH_OUT")) + ".ref").c_str(), graph);
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         last_compute_status_ = status;
+         LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+diff --git a/src/model/diffusion/qwen_image_2_1.hpp b/src/model/diffusion/qwen_image_2_1.hpp
+index 042544a..71814ee 100644
+--- a/src/model/diffusion/qwen_image_2_1.hpp
++++ b/src/model/diffusion/qwen_image_2_1.hpp
+@@ -557,7 +557,18 @@ namespace Qwen {
+                         }
+                     }
+                     auto ctx = get_context(graph);
+-                    auto out = model.forward(&ctx, make_input(x), make_input(*inputs.timesteps), cached ? nullptr : make_input(context),
++                    // ov-cgraph: name the graph inputs so a cgraph artifact can be driven by name
++                    auto x_in  = make_input(x);
++                    auto t_in  = make_input(*inputs.timesteps);
++                    auto c_in  = cached ? nullptr : make_input(context);
++                    ggml_set_name(x_in, "dit_latent");
++                    ggml_set_name(t_in, "dit_timestep");
++                    if (c_in) ggml_set_name(c_in, "dit_context");
++                    ggml_set_name(pe, "dit_pe");
++                    for (size_t mi = 0; mi < masks.size(); ++mi) {
++                        if (masks[mi]) ggml_set_name(masks[mi], ("dit_mask_" + std::to_string(mi)).c_str());
++                    }
++                    auto out = model.forward(&ctx, x_in, t_in, c_in,
+                                              ref_inputs, pe, layout, masks, checked_cache);
+                     if (!flash_attn_used) {
+                         return static_cast<ggml_cgraph*>(nullptr);
