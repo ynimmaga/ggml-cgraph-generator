@@ -119,10 +119,12 @@ int main(int argc, char** argv) {
 
     Capture cap;
     // llama.cpp fills these rotation matrices once (quantized-KV-cache Hadamard rotation of Q/K/V);
-    // they are constants of the model + cache type, not per-step inputs.
+    // they are constants of the model + cache type, not per-step inputs. So is inp_scale_rows, the
+    // per-row embedding scale (e.g. Gemma's sqrt(n_embd)), for a batch of only tokens or only embeddings.
     cap.is_constant_input = [](const ggml_tensor* t) {
         const std::string n = ggml_get_name(t);
-        return n.rfind("attn_inp_", 0) == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, "_rot") == 0;
+        return n == "inp_scale_rows" ||
+               (n.rfind("attn_inp_", 0) == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, "_rot") == 0);
     };
 
     auto mp = llama_model_default_params();
