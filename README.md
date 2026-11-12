@@ -24,18 +24,60 @@ See [END_TO_END.md](END_TO_END.md) for the whole flow: dump → build → run.
 
 ## Build
 
-Needs a built llama.cpp checkout (with `LLAMA_BUILD_TOOLS=ON`, llama.cpp's default, if
-you want `dump_vision` too — that needs `libmtmd`).
+Requirements: CMake ≥ 3.16 and a C++17 compiler. The build links llama.cpp; point
+`LLAMA_CPP_DIR` at a llama.cpp checkout (default `../llama.cpp`, relative to this repo).
+Two modes, chosen automatically at configure time:
+
+- **Prebuilt** — `<LLAMA_CPP_DIR>/build` already contains llama.cpp libraries (any
+  generator); they are linked directly. Build this project in the same configuration
+  llama.cpp was built in (e.g. `Release`) — its libraries are only usable from that
+  configuration.
+- **From source** — no prebuilt libraries found: llama.cpp is configured as a
+  subproject and only the needed targets are built (first build takes several
+  minutes).
+
+Windows (Visual Studio 17 2022):
+
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022" -DLLAMA_CPP_DIR=..\llama.cpp
+cmake --build build --config Release
+```
+
+Produces `build\Release\dump_cgraph.exe` and `dump_vision.exe`; the llama.cpp DLLs
+are copied next to them automatically (nothing is installed system-wide).
+
+Linux:
+
+```sh
+cmake -S . -B build -G Ninja -DLLAMA_CPP_DIR=../llama.cpp
+cmake --build build
+```
+
+Produces `build/dump_cgraph` and `build/dump_vision`; the executables carry an rpath
+to the llama.cpp bin directory.
+
+`dump_vision` additionally needs llama.cpp's `mtmd` library (`LLAMA_BUILD_TOOLS=ON`,
+llama.cpp's default — or the from-source mode, which builds it). A prebuilt tree
+without it skips `dump_vision` with a configure-time warning.
+
+To also build `dump_whisper`, point `WHISPER_CPP_DIR` at a built
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) tree (prebuilt-only — build
+whisper.cpp first):
+
+```sh
+cmake -S . -B build -DLLAMA_CPP_DIR=../llama.cpp -DWHISPER_CPP_DIR=/path/to/whisper.cpp
+cmake --build build
+```
+
+`dump_whisper` lands in `build/whisper/` — deliberately separate, because whisper.cpp's
+vendored ggml DLLs share names with llama.cpp's (`ggml.dll`, …) but come from a
+different fork.
+
+`./build.sh` remains as a convenience wrapper around the CMake build
+(`LLAMA_CPP_DIR`/`WHISPER_CPP_DIR` are passed through):
 
 ```sh
 LLAMA_CPP_DIR=/path/to/llama.cpp ./build.sh
-```
-
-Produces `dump_cgraph` and `dump_vision`. To also build `dump_whisper`, point `WHISPER_CPP_DIR`
-at a built [whisper.cpp](https://github.com/ggml-org/whisper.cpp) tree:
-
-```sh
-LLAMA_CPP_DIR=/path/to/llama.cpp WHISPER_CPP_DIR=/path/to/whisper.cpp ./build.sh
 ```
 
 ## `dump_cgraph` — text decoder graphs

@@ -21,6 +21,7 @@
 // trade of this approach versus OpenVINO's own builder.
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>

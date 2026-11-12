@@ -6,3 +6,9 @@ dump_whisper
 dump_cgraph_head
 dump_cgraph_nofhc
 dump_cgraph_prism
+
+# CMake build trees
+build/
+build-*/
+CMakeUserPresets.json
+.cache/

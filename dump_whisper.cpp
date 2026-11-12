@@ -28,6 +28,12 @@
 // step would then always write the same slot. Those copies are re-expressed as SET_ROWS into a
 // per-layer view of the cache, indexed by a graph input "inp_kv_idx" -- the same form llama.cpp's
 // own graphs use. Values, layout and the reading side are unchanged.
+// MSVC: g++ exposes getenv/atoi/strcmp through transitive includes, MSVC does not. These
+// must precede the unity-included whisper.cpp so its whole TU sees the declarations.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include "whisper.cpp"  // NOLINT -- see above
 
 #include "cgraph_capture.hpp"

@@ -11,6 +11,7 @@
 // consumer reimplements (1) by reading those rather than reusing llama.cpp's C++.
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
